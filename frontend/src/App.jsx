@@ -2,7 +2,13 @@
 import { useState } from "react";
 import "./App.css";
 
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5000";
+// Backend load balancer API URL
+const API_URL =
+  import.meta.env.VITE_API_URL || "http://localhost:5000";
+
+// Public URL used for short links
+const SHORT_URL_BASE =
+  import.meta.env.VITE_SHORT_URL_BASE || API_URL;
 
 export default function App() {
   const [url, setUrl] = useState("");
@@ -21,15 +27,17 @@ export default function App() {
     const originalUrl = url.trim();
 
     // Validate the URL
-    try {
-      const parsedUrl = new URL(originalUrl);
+    let parsedUrl;
 
-      if (!["http:", "https:"].includes(parsedUrl.protocol)) {
-        setError("Only HTTP and HTTPS URLs are supported.");
-        return;
-      }
+    try {
+      parsedUrl = new URL(originalUrl);
     } catch {
       setError("Please enter a valid URL beginning with https://");
+      return;
+    }
+
+    if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+      setError("Only HTTP and HTTPS URLs are supported.");
       return;
     }
 
@@ -41,13 +49,10 @@ export default function App() {
         headers: {
           "Content-Type": "application/json",
         },
-        // IMPORTANT: Backend expects originalUrl, not url
-        body: JSON.stringify({ originalUrl }),
+        body: JSON.stringify({ originalUrl: parsedUrl.href }),
       });
 
       const data = await response.json();
-
-      console.log("Backend response:", data);
 
       if (!response.ok) {
         throw new Error(
@@ -55,21 +60,21 @@ export default function App() {
         );
       }
 
-      // Read the short URL returned by the backend
+      // Prefer the complete URL returned by the backend.
       let result =
         data.shortUrl ||
         data.shortURL ||
         data.shortLink ||
         data.short_url;
 
-      // If backend returns only a short code, build the URL
+      // Fallback if the backend returns only the short code.
       if (!result && data.shortCode) {
-        result = `${API_URL}/${data.shortCode}`;
+        result = `${SHORT_URL_BASE.replace(/\/$/, "")}/${data.shortCode}`;
       }
 
       if (!result) {
         throw new Error(
-          "The backend succeeded but did not return a recognized short URL. Check the console response."
+          "The server did not return a short URL. Please check the backend response."
         );
       }
 
@@ -79,7 +84,7 @@ export default function App() {
 
       if (err.message === "Failed to fetch") {
         setError(
-          "Cannot reach the backend. Check your servers and browser CORS settings."
+          "Cannot reach the backend. Check that your servers are running and CORS is configured correctly."
         );
       } else {
         setError(err.message || "Something went wrong.");

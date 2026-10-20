@@ -9,10 +9,10 @@ const { Ratelimit } = require("@upstash/ratelimit");
 
 const app = express();
 
-// Use Render's assigned port when deployed.
-const PORT = process.env.PORT || process.env.LOAD_BALANCER_PORT || 5000;
+const PORT =
+  process.env.PORT || process.env.LOAD_BALANCER_PORT || 5000;
 
-// Allow the local Vite frontend and an optional deployed frontend.
+// CORS: local development and deployed frontend.
 const allowedOrigins = [
   "http://localhost:5173",
   "http://127.0.0.1:5173",
@@ -22,7 +22,6 @@ const allowedOrigins = [
 app.use(
   cors({
     origin(origin, callback) {
-      // Allow requests without an Origin header, such as PowerShell.
       if (!origin || allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
@@ -39,28 +38,36 @@ app.use(
   })
 );
 
-// Shared Redis client.
+// Shared Upstash Redis client.
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-// Allow 20 URL creations per IP every 60 seconds.
+// Rate limit: 20 URL creations per IP per 60 seconds.
 const urlCreationLimiter = new Ratelimit({
   redis,
   limiter: Ratelimit.slidingWindow(20, "60 s"),
   prefix: "ratelimit:url-creation",
 });
 
-const encodingServers = [
-  "http://localhost:5001",
-  "http://localhost:5003",
-];
+// Configure these in Render as comma-separated service URLs.
+// Local defaults keep development working on your laptop.
+const encodingServers = (
+  process.env.ENCODING_SERVERS ||
+  "http://localhost:5001,http://localhost:5003"
+)
+  .split(",")
+  .map((url) => url.trim().replace(/\/$/, ""))
+  .filter(Boolean);
 
-const decodingServers = [
-  "http://localhost:5002",
-  "http://localhost:5004",
-];
+const decodingServers = (
+  process.env.DECODING_SERVERS ||
+  "http://localhost:5002,http://localhost:5004"
+)
+  .split(",")
+  .map((url) => url.trim().replace(/\/$/, ""))
+  .filter(Boolean);
 
 const allServers = [...encodingServers, ...decodingServers];
 const health = new Map();
@@ -76,18 +83,18 @@ async function checkHealth() {
     allServers.map(async (server) => {
       try {
         const response = await fetch(`${server}/health`, {
-          signal: AbortSignal.timeout(2000),
+          signal: AbortSignal.timeout(3000),
         });
 
         health.set(server, response.ok);
-      } catch {
+      } catch (error) {
         health.set(server, false);
       }
     })
   );
 }
 
-// Select a healthy backend using round-robin.
+// Round-robin selection among healthy servers.
 function chooseServer(pool, name) {
   const healthy = pool.filter((server) => health.get(server));
 
@@ -103,18 +110,27 @@ function chooseServer(pool, name) {
   return healthy[index];
 }
 
-// Load balancer health endpoint.
+// Public health endpoint for the load balancer.
 app.get("/health", (req, res) => {
   const servers = Object.fromEntries(health);
-  const allHealthy = Object.values(servers).every(Boolean);
+  const hasEncoding = encodingServers.some(
+    (server) => health.get(server)
+  );
+  const hasDecoding = decodingServers.some(
+    (server) => health.get(server)
+  );
 
-  res.status(allHealthy ? 200 : 503).json({
-    status: allHealthy ? "ok" : "degraded",
+  const healthy = hasEncoding && hasDecoding;
+
+  res.status(healthy ? 200 : 503).json({
+    status: healthy ? "ok" : "degraded",
+    encoding: hasEncoding,
+    decoding: hasDecoding,
     servers,
   });
 });
 
-// Create a short URL.
+// Create short URLs.
 app.post("/api/urls", async (req, res, next) => {
   try {
     const identifier =
@@ -165,7 +181,8 @@ app.post("/api/urls", async (req, res, next) => {
   }
 });
 
-// Redirect short links through a decoding server.
+// Send all other requests, including short-code redirects,
+// to the decoding pool.
 app.use("/", (req, res, next) => {
   const target = chooseServer(decodingServers, "decoding");
 
@@ -193,7 +210,9 @@ app.use("/", (req, res, next) => {
 async function start() {
   await checkHealth();
 
-  setInterval(checkHealth, 5000);
+  // Recheck backend services every five seconds.
+  const healthTimer = setInterval(checkHealth, 5000);
+  healthTimer.unref();
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Load balancer running on port ${PORT}`);
@@ -201,4 +220,7 @@ async function start() {
   });
 }
 
-start();
+start().catch((error) => {
+  console.error("Load balancer startup failed:", error);
+  process.exit(1);
+});

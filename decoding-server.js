@@ -9,9 +9,10 @@ const { connectDatabase, redisClient } = require("./database");
 const Url = require("./url-model");
 
 const app = express();
-const PORT = process.env.DECODING_PORT || 5002;
 
-// Automatically log HTTP requests, status codes and latency.
+// Render uses PORT; local development defaults to 5002.
+const PORT = process.env.DECODING_PORT || process.env.PORT || 5002;
+
 app.use(
     pinoHttp({
         logger,
@@ -24,13 +25,13 @@ app.use(
 
 // Health check
 app.get("/health", (req, res) => {
-    res.json({
+    res.status(200).json({
         status: "ok",
         service: "decoding",
     });
 });
 
-// Redirect using a short code
+// Redirect short URLs
 app.get("/:shortCode", async (req, res) => {
     const { shortCode } = req.params;
     const cacheKey = `url:${shortCode}`;
@@ -38,7 +39,7 @@ app.get("/:shortCode", async (req, res) => {
     try {
         let originalUrl = null;
 
-        // 1. Check Redis first
+        // 1. Try Redis cache
         try {
             originalUrl = await redisClient.get(cacheKey);
 
@@ -60,7 +61,7 @@ app.get("/:shortCode", async (req, res) => {
             );
         }
 
-        // 2. If Redis misses or fails, query MongoDB
+        // 2. If cache misses, look up MongoDB
         if (!originalUrl) {
             const url = await Url.findOne({ shortCode })
                 .select("originalUrl")
@@ -79,7 +80,7 @@ app.get("/:shortCode", async (req, res) => {
 
             originalUrl = url.originalUrl;
 
-            // 3. Cache the URL without delaying the redirect
+            // 3. Populate Redis cache without blocking the redirect
             redisClient
                 .set(cacheKey, originalUrl, { ex: 3600 })
                 .catch((error) => {
@@ -90,9 +91,10 @@ app.get("/:shortCode", async (req, res) => {
                 });
         }
 
-        // 4. Redirect first; update clicks in the background
+        // 4. Redirect to the original URL
         res.redirect(302, originalUrl);
 
+        // 5. Update click count asynchronously
         Url.updateOne(
             { shortCode },
             { $inc: { clicks: 1 } }
@@ -121,14 +123,18 @@ app.get("/:shortCode", async (req, res) => {
     }
 });
 
-// Start server
+// Start server after database connections succeed
 async function startServer() {
     try {
         await connectDatabase();
 
-        app.listen(PORT, () => {
+        app.listen(PORT, "0.0.0.0", () => {
             logger.info(
-                { event: "SERVER_STARTED", port: PORT, service: "decoding" },
+                {
+                    event: "SERVER_STARTED",
+                    port: PORT,
+                    service: "decoding",
+                },
                 "Decoding server started"
             );
         });
@@ -137,6 +143,7 @@ async function startServer() {
             { event: "SERVER_STARTUP_ERROR", err: error },
             "Decoding server startup failed"
         );
+
         process.exit(1);
     }
 }
